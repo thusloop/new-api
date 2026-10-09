@@ -1,0 +1,128 @@
+name: Deploy production
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'release*'
+      - 'release/**'
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: new-api-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: production
+    steps:
+      - name: Checkout selected commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Prepare image version
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          version="deploy-${GITHUB_SHA}"
+          printf '%s\n' "$version" > VERSION
+          printf 'name=%s\nversion=%s\n' "$image" "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.name }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=production-amd64
+          cache-to: type=gha,mode=max,scope=production-amd64
+
+      - name: Install environment and deploy over SSH
+        shell: bash
+        env:
+          SERVER_HOST: ${{ vars.SERVER_HOST }}
+          SERVER_PORT: ${{ vars.SERVER_PORT || '22' }}
+          SERVER_USER: ${{ vars.SERVER_USER }}
+          APP_DOMAIN: ${{ vars.APP_DOMAIN }}
+          SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.SERVER_KNOWN_HOSTS }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
+          NEW_API_IMAGE: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
+          APP_VERSION: ${{ steps.image.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$SERVER_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.:-]*$ ]]
+          [[ "$SERVER_PORT" =~ ^[0-9]{1,5}$ ]]
+          ((10#$SERVER_PORT >= 1 && 10#$SERVER_PORT <= 65535))
+          [[ "$SERVER_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          [[ "$APP_DOMAIN" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,63}$ ]]
+          test -n "$SSH_KEY"
+          test -n "$KNOWN_HOSTS"
+          test -n "$GHCR_TOKEN"
+
+          umask 077
+          printf '%s\n' "$SSH_KEY" | tr -d '\r' > "$RUNNER_TEMP/deploy_key"
+          printf '%s\n' "$KNOWN_HOSTS" | tr -d '\r' > "$RUNNER_TEMP/known_hosts"
+          ssh_options=(
+            -i "$RUNNER_TEMP/deploy_key" -p "$SERVER_PORT"
+            -o BatchMode=yes -o IdentitiesOnly=yes
+            -o StrictHostKeyChecking=yes
+            -o "UserKnownHostsFile=$RUNNER_TEMP/known_hosts"
+            -o ConnectTimeout=20
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=4
+          )
+          destination="${SERVER_USER}@${SERVER_HOST}"
+          remote_dir=''
+          cleanup() {
+            if [[ "$remote_dir" =~ ^/tmp/new-api-deploy\.[a-zA-Z0-9]+$ ]]; then
+              # shellcheck disable=SC2029
+              ssh "${ssh_options[@]}" "$destination" "rm -rf -- '$remote_dir'" || true
+            fi
+            rm -f "$RUNNER_TEMP/deploy_key" "$RUNNER_TEMP/known_hosts"
+          }
+          trap cleanup EXIT
+
+          remote_dir=$(ssh "${ssh_options[@]}" "$destination" \
+            'sudo -n true && mktemp -d /tmp/new-api-deploy.XXXXXXXX')
+          [[ "$remote_dir" =~ ^/tmp/new-api-deploy\.[a-zA-Z0-9]+$ ]]
+          # shellcheck disable=SC2029
+          tar -czf - -C deploy/production compose.yml Caddyfile deploy.sh |
+            ssh "${ssh_options[@]}" "$destination" "tar -xzf - -C '$remote_dir'"
+
+          printf -v remote_command 'sudo -n bash %q %q %q %q %q' \
+            "$remote_dir/deploy.sh" "$APP_DOMAIN" "$NEW_API_IMAGE" "$APP_VERSION" "$REGISTRY_USER"
+          # shellcheck disable=SC2029
+          printf '%s\n' "$GHCR_TOKEN" |
+            ssh "${ssh_options[@]}" "$destination" "$remote_command"
+
+          curl --fail --silent --show-error --retry 5 --retry-all-errors \
+            --retry-delay 5 --connect-timeout 10 --max-time 20 \
+            "https://$APP_DOMAIN/api/status" |
+            jq -e --arg version "$APP_VERSION" \
+              '.success == true and .data.version == $version' > /dev/null
+          printf 'Deployed %s\n\nURL: https://%s\n\nImage: %s\n' \
+            "$APP_VERSION" "$APP_DOMAIN" "$NEW_API_IMAGE" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,123 @@
+services:
+  new-api:
+    image: ${NEW_API_IMAGE:?NEW_API_IMAGE is required}
+    restart: unless-stopped
+    command: --log-dir /app/logs
+    environment:
+      SQL_DSN: postgresql://newapi:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/new-api
+      REDIS_CONN_STRING: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD is required}@redis:6379
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET is required}
+      CRYPTO_SECRET: ${CRYPTO_SECRET:?CRYPTO_SECRET is required}
+      SESSION_COOKIE_SECURE: 'true'
+      SESSION_COOKIE_TRUSTED_URL: https://${APP_DOMAIN:?APP_DOMAIN is required}
+      TRUSTED_PROXIES: ${PROXY_SUBNET:?PROXY_SUBNET is required}
+      TZ: Asia/Shanghai
+      ERROR_LOG_ENABLED: 'true'
+      BATCH_UPDATE_ENABLED: 'true'
+      NODE_NAME: new-api-production
+      DEBUG: 'false'
+    volumes:
+      - ${DEPLOY_ROOT:?DEPLOY_ROOT is required}/data:/data
+      - ${DEPLOY_ROOT:?DEPLOY_ROOT is required}/logs:/app/logs
+    networks:
+      - backend
+      - edge
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O - http://127.0.0.1:3000/api/status | grep -Eq '"success"[[:space:]]*:[[:space:]]*true'
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+
+  postgres:
+    image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE is required}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: newapi
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: new-api
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+
+  redis:
+    image: ${REDIS_IMAGE:?REDIS_IMAGE is required}
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    command: ['sh', '-c', 'exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"']
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+    healthcheck:
+      test: ['CMD-SHELL', 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -qx PONG']
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+
+  caddy:
+    image: ${CADDY_IMAGE:?CADDY_IMAGE is required}
+    restart: unless-stopped
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?APP_DOMAIN is required}
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ${DEPLOY_ROOT:?DEPLOY_ROOT is required}/maintenance:/srv:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - edge
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: '3'
+
+networks:
+  backend:
+    internal: true
+  edge:
+    external: true
+    name: new-api-production-edge
+
+volumes:
+  postgres_data:
+    name: new-api-production-postgres
+  redis_data:
+    name: new-api-production-redis
+  caddy_data:
+    name: new-api-production-caddy-data
+  caddy_config:
+    name: new-api-production-caddy-config

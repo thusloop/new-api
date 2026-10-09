@@ -1,0 +1,19 @@
+{$APP_DOMAIN} {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+
+	@maintenance {
+		file {
+			root /srv
+			try_files maintenance
+		}
+		not path /api/status
+	}
+	respond @maintenance "Service temporarily unavailable" 503
+
+	reverse_proxy new-api:3000 {
+		flush_interval -1
+	}
+}
