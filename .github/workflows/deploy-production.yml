@@ -18,7 +18,7 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     environment: production
     steps:
       - name: Checkout selected commit
@@ -90,13 +90,10 @@ jobs:
           done
           jq -n --arg version "$APP_VERSION" --arg base "$IMAGE_BASE" --argjson images "$images" \
             '{version: $version, image_base: $base, images: $images}' > "$RUNNER_TEMP/images.json"
-          docker save "${references[@]}" | gzip -1 > "$RUNNER_TEMP/images.tar.gz"
+          docker save "${references[@]}" | gzip -6 > "$RUNNER_TEMP/images.tar.gz"
           read -r checksum _ < <(sha256sum "$RUNNER_TEMP/images.tar.gz")
           printf 'checksum=%s\n' "$checksum" >> "$GITHUB_OUTPUT"
           ls -lh "$RUNNER_TEMP/images.tar.gz"
-          tar -cf "$RUNNER_TEMP/deploy-bundle.tar" \
-            -C deploy/production compose.yml Caddyfile deploy.sh \
-            -C "$RUNNER_TEMP" images.json images.tar.gz
 
       - name: Install environment and deploy over SSH
         shell: bash
@@ -117,6 +114,7 @@ jobs:
           ((10#$SERVER_PORT >= 1 && 10#$SERVER_PORT <= 65535))
           [[ "$SERVER_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
           [[ "$APP_DOMAIN" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,63}$ ]]
+          [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
           [[ "$ARCHIVE_SHA256" =~ ^[a-f0-9]{64}$ ]]
           test -n "$SSH_KEY"
           test -n "$KNOWN_HOSTS"
@@ -136,24 +134,42 @@ jobs:
           remote_dir=''
           remote_started=false
           cleanup() {
-            # The server cleans its files once started; never remove an active import's archive.
+            # Retain failed transfers so another run of the same commit can reuse them.
             if ! $remote_started && [[ "$remote_dir" =~ ^/var/tmp/new-api-deploy\.[a-zA-Z0-9]+$ ]]; then
-              # shellcheck disable=SC2029
-              timeout --signal=TERM --kill-after=5s 20s \
-                ssh "${ssh_options[@]}" "$destination" "rm -rf -- '$remote_dir'" || true
+              printf 'Transfer directory retained: %s. Rerun this commit to resume.\n' "$remote_dir"
             fi
             rm -f "$RUNNER_TEMP/deploy_key" "$RUNNER_TEMP/known_hosts"
           }
           trap cleanup EXIT
 
-          remote_dir=$(ssh "${ssh_options[@]}" "$destination" \
-            'sudo -n flock -n /var/lock/new-api-production.lock -c true && mktemp -d /var/tmp/new-api-deploy.XXXXXXXX')
+          command -v rsync > /dev/null
+          ssh "${ssh_options[@]}" "$destination" 'sudo -n timeout --signal=TERM --kill-after=30s 5m bash -c '\''
+            if ! command -v rsync > /dev/null; then
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get -o DPkg::Lock::Timeout=120 update &&
+                apt-get -o DPkg::Lock::Timeout=120 install -y rsync
+            fi
+          '\'''
+          remote_dir="/var/tmp/new-api-deploy.${GITHUB_SHA}"
           [[ "$remote_dir" =~ ^/var/tmp/new-api-deploy\.[a-zA-Z0-9]+$ ]]
-          printf 'Transferring deployment images over SSH (20-minute limit).\n'
           # shellcheck disable=SC2029
-          timeout --signal=TERM --kill-after=30s 20m \
-            ssh "${ssh_options[@]}" "$destination" "tar -xf - -C '$remote_dir'" \
-            < "$RUNNER_TEMP/deploy-bundle.tar"
+          ssh "${ssh_options[@]}" "$destination" \
+            "umask 077; sudo -n flock -n /var/lock/new-api-production.lock -c true && test ! -L '$remote_dir' && mkdir -p -- '$remote_dir' && test -O '$remote_dir'"
+          printf -v rsync_ssh '%q ' ssh "${ssh_options[@]}"
+          rsync_destination="$destination"
+          if [[ "$SERVER_HOST" == *:* ]]; then
+            rsync_destination="${SERVER_USER}@[${SERVER_HOST}]"
+          fi
+          # Bound the remote receiver too, including when the runner disconnects.
+          rsync_receiver="timeout --signal=TERM --kill-after=30s 61m flock -n '$remote_dir/.transfer.lock' rsync"
+          printf 'Transferring deployment images with progress and resume (60-minute limit).\n'
+          timeout --signal=TERM --kill-after=30s 60m \
+            rsync --recursive --times --partial --partial-dir=.rsync-partial \
+              --info=progress2 --human-readable --timeout=120 --chmod=F600,D700 \
+              --rsync-path="$rsync_receiver" -e "$rsync_ssh" \
+              deploy/production/compose.yml deploy/production/Caddyfile deploy/production/deploy.sh \
+              "$RUNNER_TEMP/images.json" "$RUNNER_TEMP/images.tar.gz" \
+              "${rsync_destination}:${remote_dir}/"
 
           printf -v remote_command 'sudo -n timeout --signal=TERM --kill-after=30s 30m bash %q %q %q %q %q' \
             "$remote_dir/deploy.sh" "$APP_DOMAIN" "$NEW_API_IMAGE" "$APP_VERSION" "$ARCHIVE_SHA256"

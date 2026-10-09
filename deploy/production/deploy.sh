@@ -86,7 +86,11 @@ cleanup() {
       printf 'Maintenance mode remains enabled. Correct the failure and rerun this workflow.\n' >&2
     fi
   fi
-  rm -rf -- "$source_dir"
+  if ((result == 0)); then
+    rm -rf -- "$source_dir"
+  else
+    printf 'Transfer files retained for retry: %s\n' "$source_dir" >&2
+  fi
   exit "$result"
 }
 trap cleanup EXIT
