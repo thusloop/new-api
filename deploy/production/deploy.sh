@@ -2,25 +2,23 @@
 set -Eeuo pipefail
 umask 077
 
-if [[ $EUID -ne 0 || $# -ne 5 ]]; then
-  printf 'Run as root with: DOMAIN IMAGE_DIGEST APP_VERSION REGISTRY_USER INFRA_IMAGE_BASE\n' >&2
+if [[ $EUID -ne 0 || $# -ne 4 ]]; then
+  printf 'Run as root with: DOMAIN IMAGE_DIGEST APP_VERSION ARCHIVE_SHA256\n' >&2
   exit 1
 fi
 
 domain=$1
 image=$2
 version=$3
-registry_user=$4
-infra_image_base=$5
+archive_sha256=$4
 [[ "$domain" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,63}$ ]]
 [[ "$image" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[a-f0-9]{64}$ ]]
 [[ "$version" =~ ^deploy-[a-f0-9]{40}$ ]]
-[[ "$registry_user" =~ ^[a-zA-Z0-9_-]+(\[bot\])?$ ]]
-[[ "$infra_image_base" =~ ^ghcr\.io/[a-z0-9._/-]+$ ]]
-IFS= read -r registry_token
-test -n "$registry_token"
+[[ "$archive_sha256" =~ ^[a-f0-9]{64}$ ]]
+image_base=${image%@sha256:*}
 
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+[[ "$source_dir" =~ ^/var/tmp/new-api-deploy\.[a-zA-Z0-9]+$ ]]
 deploy_root=/opt/new-api-production
 exec 9>/var/lock/new-api-production.lock
 flock -n 9 || { printf 'Another deployment is running.\n' >&2; exit 1; }
@@ -60,8 +58,6 @@ if [[ -e "$deploy_root/current" && ! -L "$deploy_root/current" ]]; then
   printf 'The current release path must be a symlink.\n' >&2
   exit 1
 fi
-docker_config=$(mktemp -d /tmp/new-api-registry.XXXXXXXX)
-export DOCKER_CONFIG="$docker_config"
 release_dir=''
 maintenance_started=false
 new_app_started=false
@@ -90,14 +86,33 @@ cleanup() {
       printf 'Maintenance mode remains enabled. Correct the failure and rerun this workflow.\n' >&2
     fi
   fi
-  rm -rf -- "$docker_config"
+  rm -rf -- "$source_dir"
   exit "$result"
 }
 trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
-printf '%s\n' "$registry_token" |
-  docker login ghcr.io --username "$registry_user" --password-stdin
-unset registry_token
+printf 'Verifying transferred image archive.\n'
+printf '%s  %s\n' "$archive_sha256" "$source_dir/images.tar.gz" | sha256sum --check
+jq -e --arg version "$version" --arg base "$image_base" --arg source "$image" '
+  .version == $version and .image_base == $base and
+  (.images | keys) == ["caddy", "new-api", "postgres", "redis"] and
+  (.images | to_entries | all(
+    .value.reference == ($base + ":" + $version + "-" + .key + "-" + (.value.id | ltrimstr("sha256:"))) and
+    (.value.id | test("^sha256:[a-f0-9]{64}$"))
+  )) and .images["new-api"].source == $source
+' "$source_dir/images.json" > /dev/null
+printf 'Importing transferred images (10-minute limit).\n'
+timeout --foreground --signal=TERM --kill-after=30s 10m docker load --input "$source_dir/images.tar.gz"
+while IFS=$'\t' read -r service reference expected_id; do
+  actual_id=$(docker image inspect -f '{{.Id}}' "$reference")
+  if [[ "$actual_id" != "$expected_id" ]]; then
+    printf 'Imported image ID mismatch for %s.\n' "$service" >&2
+    exit 1
+  fi
+done < <(jq -r '.images | to_entries[] | [.key, .value.reference, .value.id] | @tsv' "$source_dir/images.json")
+image=$(jq -r '.images["new-api"].reference' "$source_dir/images.json")
 
 existing_database=false
 if docker volume inspect new-api-production-postgres >/dev/null 2>&1; then
@@ -124,16 +139,13 @@ if [[ ! -f "$deploy_root/.env" ]]; then
     printf 'SESSION_SECRET=%s\n' "$(openssl rand -hex 32)"
     printf 'CRYPTO_SECRET=%s\n' "$(openssl rand -hex 32)"
   } > "$deploy_root/.env.pending"
-  for entry in \
-    "POSTGRES_IMAGE ${infra_image_base}:infra-postgres-15" \
-    "REDIS_IMAGE ${infra_image_base}:infra-redis-7.4-alpine" \
-    "CADDY_IMAGE ${infra_image_base}:infra-caddy-2-alpine"; do
-    read -r variable image_tag <<< "$entry"
-    docker pull "$image_tag"
-    digest=$(docker image inspect -f '{{index .RepoDigests 0}}' "$image_tag")
-    [[ "$digest" == *@sha256:* ]]
-    printf '%s=%s\n' "$variable" "$digest" >> "$deploy_root/.env.pending"
+  for service in postgres redis caddy; do
+    reference=$(jq -r --arg service "$service" '.images[$service].reference' "$source_dir/images.json")
+    expected_id=$(jq -r --arg service "$service" '.images[$service].id' "$source_dir/images.json")
+    printf '%s_IMAGE=%s\n%s_IMAGE_ID=%s\n' \
+      "${service^^}" "$reference" "${service^^}" "$expected_id" >> "$deploy_root/.env.pending"
   done
+  install -m 600 "$source_dir/images.json" "$deploy_root/infrastructure-images.json"
   mv "$deploy_root/.env.pending" "$deploy_root/.env"
 fi
 chmod 600 "$deploy_root/.env"
@@ -144,6 +156,20 @@ source "$deploy_root/.env"
 set +a
 : "${DEPLOY_ROOT:?}" "${PROXY_SUBNET:?}" "${POSTGRES_IMAGE:?}" "${REDIS_IMAGE:?}" "${CADDY_IMAGE:?}"
 [[ "$DEPLOY_ROOT" == "$deploy_root" ]]
+# Existing infrastructure remains pinned; an application release must not upgrade it.
+for service in postgres redis caddy; do
+  variable="${service^^}_IMAGE"
+  id_variable="${service^^}_IMAGE_ID"
+  reference=${!variable}
+  if ! actual_id=$(docker image inspect -f '{{.Id}}' "$reference"); then
+    printf 'Pinned %s image is missing; restore it before deploying.\n' "$service" >&2
+    exit 1
+  fi
+  if [[ -v "$id_variable" && "$actual_id" != "${!id_variable}" ]]; then
+    printf 'Pinned %s image ID has changed; deployment stopped.\n' "$service" >&2
+    exit 1
+  fi
+done
 if ! docker network inspect new-api-production-edge >/dev/null 2>&1; then
   docker network create --subnet "$PROXY_SUBNET" new-api-production-edge >/dev/null
 fi
@@ -153,13 +179,13 @@ actual_subnet=$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' ne
 release_dir=$(mktemp -d "$deploy_root/releases/${version}.XXXXXXXX")
 install -m 600 "$source_dir/compose.yml" "$release_dir/compose.yml"
 install -m 600 "$source_dir/Caddyfile" "$release_dir/Caddyfile"
+install -m 600 "$source_dir/images.json" "$release_dir/images.json"
 printf 'APP_DOMAIN=%s\nNEW_API_IMAGE=%s\n' "$domain" "$image" > "$release_dir/release.env"
 compose=(docker compose --project-name new-api-production
   --env-file "$deploy_root/.env" --env-file "$release_dir/release.env"
   -f "$release_dir/compose.yml")
 "${compose[@]}" config --quiet
-"${compose[@]}" pull new-api postgres redis caddy
-docker run --rm -e "APP_DOMAIN=$domain" \
+docker run --rm --pull=never -e "APP_DOMAIN=$domain" \
   -v "$release_dir/Caddyfile:/etc/caddy/Caddyfile:ro" \
   -v "$deploy_root/maintenance:/srv:ro" \
   "$CADDY_IMAGE" caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
@@ -182,12 +208,18 @@ if $existing_database; then
   "${compose[@]}" exec -T postgres pg_restore --list < "$backup_dir/database.dump.partial" > /dev/null
   mv "$backup_dir/database.dump.partial" "$backup_dir/database.dump"
   cp "$deploy_root/.env" "$backup_dir/server.env"
+  if [[ -f "$deploy_root/infrastructure-images.json" ]]; then
+    cp "$deploy_root/infrastructure-images.json" "$backup_dir/"
+  fi
   tar -czf "$backup_dir/data.tar.gz" -C "$deploy_root" data
   if [[ -L "$deploy_root/current" ]]; then
     previous_release=$(readlink -f "$deploy_root/current")
     [[ "$previous_release" == "$deploy_root/releases/"* ]]
     cp "$previous_release/compose.yml" "$previous_release/Caddyfile" \
       "$previous_release/release.env" "$backup_dir/"
+    if [[ -f "$previous_release/images.json" ]]; then
+      cp "$previous_release/images.json" "$backup_dir/"
+    fi
   fi
   printf 'Pre-deployment backup: %s\n' "$backup_dir"
 fi

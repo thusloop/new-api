@@ -1,6 +1,7 @@
 services:
   new-api:
     image: ${NEW_API_IMAGE:?NEW_API_IMAGE is required}
+    pull_policy: never
     restart: unless-stopped
     command: --log-dir /app/logs
     environment:
@@ -43,6 +44,7 @@ services:
 
   postgres:
     image: ${POSTGRES_IMAGE:?POSTGRES_IMAGE is required}
+    pull_policy: never
     restart: unless-stopped
     environment:
       POSTGRES_USER: newapi
@@ -65,6 +67,7 @@ services:
 
   redis:
     image: ${REDIS_IMAGE:?REDIS_IMAGE is required}
+    pull_policy: never
     restart: unless-stopped
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
@@ -86,6 +89,7 @@ services:
 
   caddy:
     image: ${CADDY_IMAGE:?CADDY_IMAGE is required}
+    pull_policy: never
     restart: unless-stopped
     environment:
       APP_DOMAIN: ${APP_DOMAIN:?APP_DOMAIN is required}
