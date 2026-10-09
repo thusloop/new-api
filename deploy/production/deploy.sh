@@ -2,8 +2,8 @@
 set -Eeuo pipefail
 umask 077
 
-if [[ $EUID -ne 0 || $# -ne 4 ]]; then
-  printf 'Run as root with: DOMAIN IMAGE_DIGEST APP_VERSION REGISTRY_USER\n' >&2
+if [[ $EUID -ne 0 || $# -ne 5 ]]; then
+  printf 'Run as root with: DOMAIN IMAGE_DIGEST APP_VERSION REGISTRY_USER INFRA_IMAGE_BASE\n' >&2
   exit 1
 fi
 
@@ -11,10 +11,12 @@ domain=$1
 image=$2
 version=$3
 registry_user=$4
+infra_image_base=$5
 [[ "$domain" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,63}$ ]]
 [[ "$image" =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[a-f0-9]{64}$ ]]
 [[ "$version" =~ ^deploy-[a-f0-9]{40}$ ]]
 [[ "$registry_user" =~ ^[a-zA-Z0-9_-]+(\[bot\])?$ ]]
+[[ "$infra_image_base" =~ ^ghcr\.io/[a-z0-9._/-]+$ ]]
 IFS= read -r registry_token
 test -n "$registry_token"
 
@@ -122,7 +124,10 @@ if [[ ! -f "$deploy_root/.env" ]]; then
     printf 'SESSION_SECRET=%s\n' "$(openssl rand -hex 32)"
     printf 'CRYPTO_SECRET=%s\n' "$(openssl rand -hex 32)"
   } > "$deploy_root/.env.pending"
-  for entry in 'POSTGRES_IMAGE postgres:15' 'REDIS_IMAGE redis:7.4-alpine' 'CADDY_IMAGE caddy:2-alpine'; do
+  for entry in \
+    "POSTGRES_IMAGE ${infra_image_base}:infra-postgres-15" \
+    "REDIS_IMAGE ${infra_image_base}:infra-redis-7.4-alpine" \
+    "CADDY_IMAGE ${infra_image_base}:infra-caddy-2-alpine"; do
     read -r variable image_tag <<< "$entry"
     docker pull "$image_tag"
     digest=$(docker image inspect -f '{{index .RepoDigests 0}}' "$image_tag")

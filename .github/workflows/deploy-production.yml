@@ -60,6 +60,23 @@ jobs:
           cache-from: type=gha,scope=production-amd64
           cache-to: type=gha,mode=max,scope=production-amd64
 
+      - name: Mirror infrastructure images to GHCR
+        shell: bash
+        env:
+          INFRA_IMAGE_BASE: ${{ steps.image.outputs.name }}
+        run: |
+          set -euo pipefail
+          while read -r source tag; do
+            destination="${INFRA_IMAGE_BASE}:infra-${tag}"
+            docker pull "$source"
+            docker tag "$source" "$destination"
+            docker push "$destination"
+          done <<'IMAGES'
+          postgres:15 postgres-15
+          redis:7.4-alpine redis-7.4-alpine
+          caddy:2-alpine caddy-2-alpine
+          IMAGES
+
       - name: Install environment and deploy over SSH
         shell: bash
         env:
@@ -71,6 +88,7 @@ jobs:
           KNOWN_HOSTS: ${{ secrets.SERVER_KNOWN_HOSTS }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REGISTRY_USER: ${{ github.actor }}
+          INFRA_IMAGE_BASE: ${{ steps.image.outputs.name }}
           NEW_API_IMAGE: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
           APP_VERSION: ${{ steps.image.outputs.version }}
         run: |
@@ -80,6 +98,7 @@ jobs:
           ((10#$SERVER_PORT >= 1 && 10#$SERVER_PORT <= 65535))
           [[ "$SERVER_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
           [[ "$APP_DOMAIN" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,63}$ ]]
+          [[ "$INFRA_IMAGE_BASE" =~ ^ghcr\.io/[a-z0-9._/-]+$ ]]
           test -n "$SSH_KEY"
           test -n "$KNOWN_HOSTS"
           test -n "$GHCR_TOKEN"
@@ -113,8 +132,8 @@ jobs:
           tar -czf - -C deploy/production compose.yml Caddyfile deploy.sh |
             ssh "${ssh_options[@]}" "$destination" "tar -xzf - -C '$remote_dir'"
 
-          printf -v remote_command 'sudo -n bash %q %q %q %q %q' \
-            "$remote_dir/deploy.sh" "$APP_DOMAIN" "$NEW_API_IMAGE" "$APP_VERSION" "$REGISTRY_USER"
+          printf -v remote_command 'sudo -n bash %q %q %q %q %q %q' \
+            "$remote_dir/deploy.sh" "$APP_DOMAIN" "$NEW_API_IMAGE" "$APP_VERSION" "$REGISTRY_USER" "$INFRA_IMAGE_BASE"
           # shellcheck disable=SC2029
           printf '%s\n' "$GHCR_TOKEN" |
             ssh "${ssh_options[@]}" "$destination" "$remote_command"
