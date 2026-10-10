@@ -29,12 +29,30 @@ jobs:
       - name: Prepare image version
         id: image
         shell: bash
+        env:
+          REGISTRY_HOST: ${{ vars.REGISTRY_HOST }}
+          REGISTRY_NAMESPACE: ${{ vars.REGISTRY_NAMESPACE }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
         run: |
           set -euo pipefail
+          if [[ ! "$REGISTRY_HOST" =~ ^ccr\.ccs\.tencentyun\.com$ && ! "$REGISTRY_HOST" =~ ^[a-z0-9][a-z0-9.-]*\.tencentcr\.com$ ]]; then
+            printf 'Set production variable REGISTRY_HOST to the Tencent registry hostname.\n' >&2
+            exit 1
+          fi
+          if [[ ! "$REGISTRY_NAMESPACE" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]]; then
+            printf 'Set production variable REGISTRY_NAMESPACE to your namespace.\n' >&2
+            exit 1
+          fi
+          if [[ -z "$REGISTRY_USERNAME" || -z "$REGISTRY_PASSWORD" ]]; then
+            printf 'Set production secrets REGISTRY_USERNAME and REGISTRY_PASSWORD.\n' >&2
+            exit 1
+          fi
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          mirror="${REGISTRY_HOST}/${REGISTRY_NAMESPACE}/new-api"
           version="deploy-${GITHUB_SHA}"
           printf '%s\n' "$version" > VERSION
-          printf 'name=%s\nversion=%s\n' "$image" "$version" >> "$GITHUB_OUTPUT"
+          printf 'name=%s\nmirror=%s\nversion=%s\n' "$image" "$mirror" "$version" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
@@ -45,6 +63,13 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Tencent Container Registry
+        uses: docker/login-action@c99871dec2022cc055c062a10cc1a1310835ceb4 # v4.3.0
+        with:
+          registry: ${{ vars.REGISTRY_HOST }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
 
       - name: Build and publish image
         id: build
@@ -60,40 +85,45 @@ jobs:
           cache-from: type=gha,scope=production-amd64
           cache-to: type=gha,mode=max,scope=production-amd64
 
-      - name: Prepare deployment image archive
-        id: archive
-        timeout-minutes: 15
+      - name: Mirror deployment images to Tencent registry
+        id: manifest
+        timeout-minutes: 45
         shell: bash
         env:
-          IMAGE_BASE: ${{ steps.image.outputs.name }}
+          IMAGE_BASE: ${{ steps.image.outputs.mirror }}
           NEW_API_IMAGE: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
           APP_VERSION: ${{ steps.image.outputs.version }}
         run: |
           set -euo pipefail
           images='{}'
-          references=()
           for entry in "$NEW_API_IMAGE new-api" 'postgres:15 postgres' \
             'redis:7.4-alpine redis' 'caddy:2-alpine caddy'; do
             read -r source service <<< "$entry"
-            docker pull "$source"
+            timeout --signal=TERM --kill-after=30s 5m docker pull --platform linux/amd64 "$source"
             image_id=$(docker image inspect -f '{{.Id}}' "$source")
-            reference="${IMAGE_BASE}:${APP_VERSION}-${service}-${image_id#sha256:}"
-            docker tag "$source" "$reference"
             source_digest=$(docker image inspect -f '{{index .RepoDigests 0}}' "$source")
             if [[ "$service" == new-api ]]; then
               source_digest="$NEW_API_IMAGE"
+              tag="$APP_VERSION"
+            else
+              tag="infra-${service}-${image_id#sha256:}"
             fi
+            reference="${IMAGE_BASE}:${tag}"
+            docker tag "$source" "$reference"
+            printf 'Pushing %s image to Tencent registry (10-minute limit).\n' "$service"
+            timeout --signal=TERM --kill-after=30s 10m docker push "$reference"
+            # Resolve the pushed manifest, whose digest differs from the image config ID.
+            reference=$(docker image inspect "$reference" | jq -er --arg prefix "$IMAGE_BASE@sha256:" \
+              '.[0].RepoDigests | map(select(startswith($prefix))) | unique | if length == 1 then .[0] else error("Missing registry digest") end')
             images=$(jq -c --arg service "$service" --arg reference "$reference" \
               --arg id "$image_id" --arg source "$source_digest" \
               '. + {($service): {reference: $reference, id: $id, source: $source}}' <<< "$images")
-            references+=("$reference")
           done
           jq -n --arg version "$APP_VERSION" --arg base "$IMAGE_BASE" --argjson images "$images" \
             '{version: $version, image_base: $base, images: $images}' > "$RUNNER_TEMP/images.json"
-          docker save "${references[@]}" | gzip -6 > "$RUNNER_TEMP/images.tar.gz"
-          read -r checksum _ < <(sha256sum "$RUNNER_TEMP/images.tar.gz")
+          read -r checksum _ < <(sha256sum "$RUNNER_TEMP/images.json")
           printf 'checksum=%s\n' "$checksum" >> "$GITHUB_OUTPUT"
-          ls -lh "$RUNNER_TEMP/images.tar.gz"
+          jq -r '.images | to_entries[] | "\(.key): \(.value.reference)"' "$RUNNER_TEMP/images.json"
 
       - name: Install environment and deploy over SSH
         shell: bash
@@ -106,7 +136,9 @@ jobs:
           KNOWN_HOSTS: ${{ secrets.SERVER_KNOWN_HOSTS }}
           NEW_API_IMAGE: ${{ steps.image.outputs.name }}@${{ steps.build.outputs.digest }}
           APP_VERSION: ${{ steps.image.outputs.version }}
-          ARCHIVE_SHA256: ${{ steps.archive.outputs.checksum }}
+          MANIFEST_SHA256: ${{ steps.manifest.outputs.checksum }}
+          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
         run: |
           set -euo pipefail
           [[ "$SERVER_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.:-]*$ ]]
@@ -115,7 +147,7 @@ jobs:
           [[ "$SERVER_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
           [[ "$APP_DOMAIN" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,63}$ ]]
           [[ "$GITHUB_SHA" =~ ^[a-f0-9]{40}$ ]]
-          [[ "$ARCHIVE_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$MANIFEST_SHA256" =~ ^[a-f0-9]{64}$ ]]
           test -n "$SSH_KEY"
           test -n "$KNOWN_HOSTS"
 
@@ -134,48 +166,30 @@ jobs:
           remote_dir=''
           remote_started=false
           cleanup() {
-            # Retain failed transfers so another run of the same commit can reuse them.
             if ! $remote_started && [[ "$remote_dir" =~ ^/var/tmp/new-api-deploy\.[a-zA-Z0-9]+$ ]]; then
-              printf 'Transfer directory retained: %s. Rerun this commit to resume.\n' "$remote_dir"
+              printf 'Deployment files retained: %s.\n' "$remote_dir"
             fi
             rm -f "$RUNNER_TEMP/deploy_key" "$RUNNER_TEMP/known_hosts"
           }
           trap cleanup EXIT
 
-          command -v rsync > /dev/null
-          ssh "${ssh_options[@]}" "$destination" 'sudo -n timeout --signal=TERM --kill-after=30s 5m bash -c '\''
-            if ! command -v rsync > /dev/null; then
-              export DEBIAN_FRONTEND=noninteractive
-              apt-get -o DPkg::Lock::Timeout=120 update &&
-                apt-get -o DPkg::Lock::Timeout=120 install -y rsync
-            fi
-          '\'''
-          remote_dir="/var/tmp/new-api-deploy.${GITHUB_SHA}"
+          remote_dir=$(ssh "${ssh_options[@]}" "$destination" \
+            'umask 077; sudo -n flock -n /var/lock/new-api-production.lock -c true && mktemp -d /var/tmp/new-api-deploy.XXXXXXXX')
           [[ "$remote_dir" =~ ^/var/tmp/new-api-deploy\.[a-zA-Z0-9]+$ ]]
+          printf 'Transferring deployment configuration over SSH (2-minute limit).\n'
           # shellcheck disable=SC2029
-          ssh "${ssh_options[@]}" "$destination" \
-            "umask 077; sudo -n flock -n /var/lock/new-api-production.lock -c true && test ! -L '$remote_dir' && mkdir -p -- '$remote_dir' && test -O '$remote_dir'"
-          printf -v rsync_ssh '%q ' ssh "${ssh_options[@]}"
-          rsync_destination="$destination"
-          if [[ "$SERVER_HOST" == *:* ]]; then
-            rsync_destination="${SERVER_USER}@[${SERVER_HOST}]"
-          fi
-          # Bound the remote receiver too, including when the runner disconnects.
-          rsync_receiver="timeout --signal=TERM --kill-after=30s 61m flock -n '$remote_dir/.transfer.lock' rsync"
-          printf 'Transferring deployment images with progress and resume (60-minute limit).\n'
-          timeout --signal=TERM --kill-after=30s 60m \
-            rsync --recursive --times --partial --partial-dir=.rsync-partial \
-              --info=progress2 --human-readable --timeout=120 --chmod=F600,D700 \
-              --rsync-path="$rsync_receiver" -e "$rsync_ssh" \
-              deploy/production/compose.yml deploy/production/Caddyfile deploy/production/deploy.sh \
-              "$RUNNER_TEMP/images.json" "$RUNNER_TEMP/images.tar.gz" \
-              "${rsync_destination}:${remote_dir}/"
+          tar -czf - -C deploy/production compose.yml Caddyfile deploy.sh \
+            -C "$RUNNER_TEMP" images.json |
+            timeout --signal=TERM --kill-after=30s 2m ssh "${ssh_options[@]}" "$destination" \
+              "umask 077; timeout --signal=TERM --kill-after=30s 3m tar -xzf - -C '$remote_dir'"
 
-          printf -v remote_command 'sudo -n timeout --signal=TERM --kill-after=30s 30m bash %q %q %q %q %q' \
-            "$remote_dir/deploy.sh" "$APP_DOMAIN" "$NEW_API_IMAGE" "$APP_VERSION" "$ARCHIVE_SHA256"
+          printf -v remote_command 'sudo -n timeout --signal=TERM --kill-after=30s 60m bash %q %q %q %q %q' \
+            "$remote_dir/deploy.sh" "$APP_DOMAIN" "$NEW_API_IMAGE" "$APP_VERSION" "$MANIFEST_SHA256"
           remote_started=true
+          # Credentials travel only through encrypted stdin, never command arguments or deployment files.
           # shellcheck disable=SC2029
-          ssh "${ssh_options[@]}" "$destination" "$remote_command"
+          jq -n '{username: env.REGISTRY_USERNAME, password: env.REGISTRY_PASSWORD}' |
+            ssh "${ssh_options[@]}" "$destination" "$remote_command"
 
           curl --fail --silent --show-error --retry 5 --retry-all-errors \
             --retry-delay 5 --connect-timeout 10 --max-time 20 \
