@@ -18,7 +18,7 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 210
     environment: production
     steps:
       - name: Checkout selected commit
@@ -87,7 +87,7 @@ jobs:
 
       - name: Mirror deployment images to Tencent registry
         id: manifest
-        timeout-minutes: 45
+        timeout-minutes: 120
         shell: bash
         env:
           IMAGE_BASE: ${{ steps.image.outputs.mirror }}
@@ -110,8 +110,25 @@ jobs:
             fi
             reference="${IMAGE_BASE}:${tag}"
             docker tag "$source" "$reference"
-            printf 'Pushing %s image to Tencent registry (10-minute limit).\n' "$service"
-            timeout --signal=TERM --kill-after=30s 10m docker push "$reference"
+            docker image inspect -f 'Image config: {{.Id}}; uncompressed size: {{.Size}} bytes' "$source"
+            for attempt in 1 2; do
+              push_started=$SECONDS
+              printf 'Pushing %s image to Tencent registry (attempt %s/2, 30-minute limit).\n' "$service" "$attempt"
+              if timeout --signal=TERM --kill-after=30s 30m docker push "$reference"; then
+                printf 'Pushed %s image in %s seconds.\n' "$service" "$((SECONDS - push_started))"
+                break
+              else
+                push_status=$?
+              fi
+              printf 'Push failed for %s after %s seconds (exit %s).\n' \
+                "$service" "$((SECONDS - push_started))" "$push_status" >&2
+              if ((attempt == 2)) || [[ "$push_status" != 1 && "$push_status" != 124 ]]; then
+                exit "$push_status"
+              fi
+              # Completed layers can be reused; an unfinished layer may upload again from the start.
+              printf 'Retrying in 10 seconds. Completed registry layers will be reused when available.\n'
+              sleep 10
+            done
             # Resolve the pushed manifest, whose digest differs from the image config ID.
             reference=$(docker image inspect "$reference" | jq -er --arg prefix "$IMAGE_BASE@sha256:" \
               '.[0].RepoDigests | map(select(startswith($prefix))) | unique | if length == 1 then .[0] else error("Missing registry digest") end')
